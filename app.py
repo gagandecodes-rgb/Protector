@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 import asyncpg
+import httpx
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
 
@@ -113,21 +114,11 @@ def status_emoji(status: str) -> str:
     return {"valid": "✅", "invalid": "❌", "unknown": "⚠️"}.get(status, "⚠️")
 
 # =========================================================
-# SHEIN CHECKER (placeholder — replace with real method)
+# SHEIN CHECKER (REAL endpoint based on your cURL)
 # =========================================================
-import httpx
-
 SHEIN_APPLY_VOUCHER_URL = "https://www.sheinindia.in/api/cart/apply-voucher"
 
 async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]:
-    """
-    Checks a SHEIN voucher by calling the same endpoint as the website.
-
-    Returns:
-      {"status":"valid"/"invalid"/"unknown", "details":"..."}
-    """
-
-    # Minimal headers needed (copied from your curl, but trimmed)
     headers = {
         "accept": "application/json",
         "content-type": "application/json",
@@ -135,56 +126,33 @@ async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]
         "referer": "https://www.sheinindia.in/cart",
         "user-agent": "Mozilla/5.0",
         "x-tenant-id": "SHEIN",
-        "cookie": cookie,   # <-- IMPORTANT: use the user's cookie here
+        "cookie": cookie,
     }
 
-    payload = {
-        "voucherId": code,
-        "device": {"client_type": "web"}
-    }
+    payload = {"voucherId": code, "device": {"client_type": "web"}}
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(SHEIN_APPLY_VOUCHER_URL, headers=headers, json=payload)
 
-        # Try parse JSON (SHEIN usually replies JSON even on errors)
         try:
             data = r.json()
         except Exception:
             data = None
 
-        # --- Interpret result ---
-        # Most common:
-        # - 200 => applied (valid)
-        # - 400 => invalid/expired/not eligible
-        # - 401/403 => cookie expired/blocked
-        # - 429 => rate limited
-
         if r.status_code == 200:
-            # Often contains discount info; show small details safely
-            details = ""
-            if isinstance(data, dict):
-                # try common keys
-                msg = data.get("msg") or data.get("message") or data.get("tip")
-                if msg:
-                    details = str(msg)
-                else:
-                    details = "Applied successfully."
-            else:
-                details = "Applied successfully."
-            return {"status": "valid", "details": details}
-
-        if r.status_code == 400:
-            # Usually invalid/expired/not applicable
             msg = ""
             if isinstance(data, dict):
                 msg = data.get("msg") or data.get("message") or data.get("tip") or ""
-                # Sometimes error nested
+            return {"status": "valid", "details": msg or "Applied successfully."}
+
+        if r.status_code == 400:
+            msg = ""
+            if isinstance(data, dict):
+                msg = data.get("msg") or data.get("message") or data.get("tip") or ""
                 if not msg and isinstance(data.get("info"), dict):
                     msg = data["info"].get("msg") or data["info"].get("message") or ""
-            if not msg:
-                msg = "Invalid / not applicable (HTTP 400)."
-            return {"status": "invalid", "details": msg}
+            return {"status": "invalid", "details": msg or "Invalid / not applicable."}
 
         if r.status_code in (401, 403):
             return {"status": "unknown", "details": "Cookie expired / not authorized. Please /setcookie again."}
@@ -192,7 +160,6 @@ async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]
         if r.status_code == 429:
             return {"status": "unknown", "details": "Rate limited by SHEIN (429). Try later."}
 
-        # Fallback
         preview = ""
         if isinstance(data, dict):
             preview = str(data)[:300]
@@ -212,6 +179,7 @@ async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]
 fastapi_app = FastAPI()
 tg_app: Optional[Application] = None
 
+# Users who are currently in "waiting for cookie"
 COOKIE_WAITING = set()
 
 # ---------------- Commands ----------------
@@ -219,11 +187,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 SHEIN Code Checker + Protector Bot\n\n"
         "Setup:\n"
-        "1) /setcookie (paste your SHEIN cookie)\n"
-        "2) Send a code → I will check\n"
-        "3) Enable auto-check: /protect CODE\n\n"
+        "1) /setcookie\n"
+        "   - Paste cookie in 1 message OR upload cookie.txt\n"
+        "2) /check CODE or just send a code\n"
+        "3) /protect CODE (auto-check every 15 minutes)\n\n"
         "Commands:\n"
-        "/setcookie - upload cookie\n"
+        "/setcookie - upload cookie (message or file)\n"
         "/delcookie - delete cookie\n"
         "/protect CODE - enable protection\n"
         "/remove CODE - remove protected code\n"
@@ -235,8 +204,10 @@ async def setcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     COOKIE_WAITING.add(user_id)
     await update.message.reply_text(
-        "🧾 Send your SHEIN cookie string now (paste in ONE message).\n\n"
-        "Browser → DevTools → Network → choose request → Headers → Cookie"
+        "🧾 Send your SHEIN cookie now.\n\n"
+        "✅ Option 1: Paste cookie in ONE message\n"
+        "✅ Option 2 (BEST): Upload a file cookie.txt containing the full cookie\n\n"
+        "Tip: Browser → DevTools → Network → request → Headers → Cookie"
     )
 
 async def delcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -322,16 +293,45 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     msg = await update.message.reply_text(f"🔎 Checking `{code}` ...", parse_mode="Markdown")
+    result = await check_shein_code_with_cookie(code, cookie)
+    st = result.get("status", "unknown")
+    details = result.get("details", "")
+    await msg.edit_text(
+        f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}",
+        parse_mode="Markdown"
+    )
+
+# ---------------- NEW: Cookie upload via file ----------------
+async def on_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if user_id not in COOKIE_WAITING:
+        await update.message.reply_text("Use /setcookie first, then upload cookie.txt")
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    # Optional: only allow .txt (not mandatory)
+    # if doc.file_name and not doc.file_name.lower().endswith(".txt"):
+    #     await update.message.reply_text("Please upload a .txt file containing the cookie.")
+    #     return
+
+    tg_file = await context.bot.get_file(doc.file_id)
+    content_bytes = await tg_file.download_as_bytearray()
+    cookie_text = content_bytes.decode("utf-8", errors="ignore").strip()
+
+    COOKIE_WAITING.remove(user_id)
+    await set_user_cookie(user_id, cookie_text)
+
+    # Try to delete file message (privacy)
     try:
-        result = await check_shein_code_with_cookie(code, cookie)
-        st = result.get("status", "unknown")
-        details = result.get("details", "")
-        await msg.edit_text(
-            f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await msg.edit_text(f"❌ Check failed: {e}")
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+    except:
+        pass
+
+    await update.effective_chat.send_message("✅ Cookie file saved. Now try /check CODE or send a code.")
 
 # ---------------- Text Handler ----------------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -341,27 +341,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Cookie capture flow
+    # Cookie capture by text
     if user_id in COOKIE_WAITING:
         COOKIE_WAITING.remove(user_id)
         await set_user_cookie(user_id, text)
 
-        # Try to delete the message with cookie (privacy)
+        # Try to delete cookie message (privacy)
         try:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=update.message.message_id
-            )
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
         except:
             pass
 
-        await update.effective_chat.send_message("✅ Cookie saved. Now send a code or use /check CODE.")
+        await update.effective_chat.send_message("✅ Cookie saved. Now try /check CODE or send a code.")
         return
 
     if text.startswith("/"):
         return
 
-    # If user sends a code directly
+    # User sends a code directly
     code = normalize_code(text)
     cookie = await get_user_cookie(user_id)
     if not cookie:
@@ -369,18 +366,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     msg = await update.message.reply_text(f"🔎 Checking `{code}` ...", parse_mode="Markdown")
-    try:
-        result = await check_shein_code_with_cookie(code, cookie)
-        st = result.get("status", "unknown")
-        details = result.get("details", "")
-        await msg.edit_text(
-            f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}\n\n"
-            f"Enable auto-check every {CHECK_INTERVAL_MINUTES} minutes:\n"
-            f"Use: /protect {code}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await msg.edit_text(f"❌ Check failed: {e}")
+    result = await check_shein_code_with_cookie(code, cookie)
+    st = result.get("status", "unknown")
+    details = result.get("details", "")
+    await msg.edit_text(
+        f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}\n\n"
+        f"Enable auto-check every {CHECK_INTERVAL_MINUTES} minutes:\n"
+        f"Use: /protect {code}",
+        parse_mode="Markdown"
+    )
 
 # =========================================================
 # Scheduler: checks ONLY DUE codes from DB
@@ -442,7 +436,6 @@ async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
 
         except Exception as e:
-            # push next_check_at forward to avoid tight error loop
             next_time = now + timedelta(minutes=CHECK_INTERVAL_MINUTES)
             async with pool.acquire() as con:
                 await con.execute(
@@ -471,7 +464,6 @@ async def on_startup():
     global tg_app
     await db_init()
 
-    # ✅ FIX: explicitly attach a JobQueue
     jq = JobQueue()
     tg_app = Application.builder().token(BOT_TOKEN).job_queue(jq).build()
 
@@ -482,12 +474,14 @@ async def on_startup():
     tg_app.add_handler(CommandHandler("remove", remove_cmd))
     tg_app.add_handler(CommandHandler("mycodes", mycodes_cmd))
     tg_app.add_handler(CommandHandler("check", check_cmd))
+
+    # ✅ IMPORTANT: file handler BEFORE text handler
+    tg_app.add_handler(MessageHandler(filters.Document.ALL, on_cookie_file))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     await tg_app.initialize()
     await tg_app.start()
 
-    # scheduler
     tg_app.job_queue.run_repeating(
         scheduler_job,
         interval=SCHEDULER_POLL_SECONDS,
@@ -495,7 +489,6 @@ async def on_startup():
         name="global_scheduler"
     )
 
-    # webhook
     webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
     await tg_app.bot.set_webhook(webhook_url)
     print("Webhook set to:", webhook_url)
