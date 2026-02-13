@@ -115,11 +115,96 @@ def status_emoji(status: str) -> str:
 # =========================================================
 # SHEIN CHECKER (placeholder — replace with real method)
 # =========================================================
+import httpx
+
+SHEIN_APPLY_VOUCHER_URL = "https://www.sheinindia.in/api/cart/apply-voucher"
+
 async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]:
-    # Placeholder so bot runs
-    if len(code) < 6:
-        return {"status": "invalid", "details": "Too short (placeholder)."}
-    return {"status": "unknown", "details": "Checker not configured yet. Plug real SHEIN request."}
+    """
+    Checks a SHEIN voucher by calling the same endpoint as the website.
+
+    Returns:
+      {"status":"valid"/"invalid"/"unknown", "details":"..."}
+    """
+
+    # Minimal headers needed (copied from your curl, but trimmed)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://www.sheinindia.in",
+        "referer": "https://www.sheinindia.in/cart",
+        "user-agent": "Mozilla/5.0",
+        "x-tenant-id": "SHEIN",
+        "cookie": cookie,   # <-- IMPORTANT: use the user's cookie here
+    }
+
+    payload = {
+        "voucherId": code,
+        "device": {"client_type": "web"}
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(SHEIN_APPLY_VOUCHER_URL, headers=headers, json=payload)
+
+        # Try parse JSON (SHEIN usually replies JSON even on errors)
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+
+        # --- Interpret result ---
+        # Most common:
+        # - 200 => applied (valid)
+        # - 400 => invalid/expired/not eligible
+        # - 401/403 => cookie expired/blocked
+        # - 429 => rate limited
+
+        if r.status_code == 200:
+            # Often contains discount info; show small details safely
+            details = ""
+            if isinstance(data, dict):
+                # try common keys
+                msg = data.get("msg") or data.get("message") or data.get("tip")
+                if msg:
+                    details = str(msg)
+                else:
+                    details = "Applied successfully."
+            else:
+                details = "Applied successfully."
+            return {"status": "valid", "details": details}
+
+        if r.status_code == 400:
+            # Usually invalid/expired/not applicable
+            msg = ""
+            if isinstance(data, dict):
+                msg = data.get("msg") or data.get("message") or data.get("tip") or ""
+                # Sometimes error nested
+                if not msg and isinstance(data.get("info"), dict):
+                    msg = data["info"].get("msg") or data["info"].get("message") or ""
+            if not msg:
+                msg = "Invalid / not applicable (HTTP 400)."
+            return {"status": "invalid", "details": msg}
+
+        if r.status_code in (401, 403):
+            return {"status": "unknown", "details": "Cookie expired / not authorized. Please /setcookie again."}
+
+        if r.status_code == 429:
+            return {"status": "unknown", "details": "Rate limited by SHEIN (429). Try later."}
+
+        # Fallback
+        preview = ""
+        if isinstance(data, dict):
+            preview = str(data)[:300]
+        else:
+            preview = (r.text or "")[:300]
+
+        return {"status": "unknown", "details": f"HTTP {r.status_code}. {preview}"}
+
+    except httpx.TimeoutException:
+        return {"status": "unknown", "details": "Timeout contacting SHEIN. Try again."}
+    except Exception as e:
+        return {"status": "unknown", "details": f"Checker error: {e}"}
 
 # =========================================================
 # Telegram Bot + FastAPI Webhook
