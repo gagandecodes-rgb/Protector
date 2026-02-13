@@ -1,12 +1,10 @@
 import os
 import re
-import time
 import base64
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
 import asyncpg
-import httpx
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request
 
@@ -15,9 +13,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
+    JobQueue,
 )
 
 # =========================================================
@@ -28,6 +26,7 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()           # https://your-servic
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()   # random secret string
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()       # Supabase Postgres URL
 COOKIE_SECRET = os.getenv("COOKIE_SECRET", "").strip()     # random long string
+
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
 SCHEDULER_POLL_SECONDS = int(os.getenv("SCHEDULER_POLL_SECONDS", "60"))
 
@@ -43,8 +42,7 @@ if not COOKIE_SECRET:
     raise RuntimeError("COOKIE_SECRET missing")
 
 # =========================================================
-# SIMPLE SECURITY: encrypt cookies before storing
-# (Recommended since cookies are sensitive)
+# Encrypt cookies before storing (recommended)
 # =========================================================
 def _derive_fernet_key(secret: str) -> bytes:
     raw = secret.encode("utf-8")
@@ -103,6 +101,9 @@ async def get_user_cookie(user_id: int) -> Optional[str]:
         return None
     return decrypt_cookie(row["cookie_enc"])
 
+# =========================================================
+# Helpers
+# =========================================================
 def normalize_code(text: str) -> str:
     text = text.strip()
     text = re.sub(r"\s+", "", text)
@@ -112,30 +113,20 @@ def status_emoji(status: str) -> str:
     return {"valid": "✅", "invalid": "❌", "unknown": "⚠️"}.get(status, "⚠️")
 
 # =========================================================
-# SHEIN CHECKER (YOU MUST PLUG YOUR REAL METHOD)
-# - This function receives the USER'S cookie.
-# - Keep it light: do not spam.
+# SHEIN CHECKER (placeholder — replace with real method)
 # =========================================================
 async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]:
-    """
-    Implement using your captured request from DevTools.
-    Return:
-      {"status":"valid"/"invalid"/"unknown", "details":"..."}
-    """
-
-    # ---- PLACEHOLDER (so bot runs) ----
-    # Replace this with real SHEIN request logic.
+    # Placeholder so bot runs
     if len(code) < 6:
         return {"status": "invalid", "details": "Too short (placeholder)."}
     return {"status": "unknown", "details": "Checker not configured yet. Plug real SHEIN request."}
 
 # =========================================================
-# Telegram Bot
+# Telegram Bot + FastAPI Webhook
 # =========================================================
 fastapi_app = FastAPI()
 tg_app: Optional[Application] = None
 
-# Users who are currently in "waiting for cookie message" mode
 COOKIE_WAITING = set()
 
 # ---------------- Commands ----------------
@@ -145,9 +136,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Setup:\n"
         "1) /setcookie (paste your SHEIN cookie)\n"
         "2) Send a code → I will check\n"
-        "3) If you want auto-check: /protect CODE\n\n"
+        "3) Enable auto-check: /protect CODE\n\n"
         "Commands:\n"
-        "/setcookie - upload cookie (1 message)\n"
+        "/setcookie - upload cookie\n"
         "/delcookie - delete cookie\n"
         "/protect CODE - enable protection\n"
         "/remove CODE - remove protected code\n"
@@ -160,8 +151,7 @@ async def setcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     COOKIE_WAITING.add(user_id)
     await update.message.reply_text(
         "🧾 Send your SHEIN cookie string now (paste in ONE message).\n\n"
-        "Tip: Browser → DevTools → Network → pick any request → Headers → Cookie.\n"
-        "After you send it, I will store it encrypted."
+        "Browser → DevTools → Network → choose request → Headers → Cookie"
     )
 
 async def delcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -239,8 +229,8 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Usage: /check CODE")
         return
-    code = normalize_code("".join(context.args))
 
+    code = normalize_code("".join(context.args))
     cookie = await get_user_cookie(user_id)
     if not cookie:
         await update.message.reply_text("❌ Set your cookie first: /setcookie")
@@ -266,14 +256,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # 1) Cookie capture flow
+    # Cookie capture flow
     if user_id in COOKIE_WAITING:
         COOKIE_WAITING.remove(user_id)
-        cookie_text = text
+        await set_user_cookie(user_id, text)
 
-        await set_user_cookie(user_id, cookie_text)
-
-        # Optional: delete cookie message to reduce exposure
+        # Try to delete the message with cookie (privacy)
         try:
             await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
@@ -285,10 +273,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_chat.send_message("✅ Cookie saved. Now send a code or use /check CODE.")
         return
 
-    # 2) If user just sends a code directly -> do a check now
     if text.startswith("/"):
         return
 
+    # If user sends a code directly
     code = normalize_code(text)
     cookie = await get_user_cookie(user_id)
     if not cookie:
@@ -302,7 +290,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         details = result.get("details", "")
         await msg.edit_text(
             f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}\n\n"
-            f"If you want auto-check every {CHECK_INTERVAL_MINUTES} minutes:\n"
+            f"Enable auto-check every {CHECK_INTERVAL_MINUTES} minutes:\n"
             f"Use: /protect {code}",
             parse_mode="Markdown"
         )
@@ -310,12 +298,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(f"❌ Check failed: {e}")
 
 # =========================================================
-# Scheduler: runs globally and checks only DUE codes
+# Scheduler: checks ONLY DUE codes from DB
 # =========================================================
 async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(timezone.utc)
 
-    # Fetch due items (limit to avoid overload)
     async with pool.acquire() as con:
         rows = await con.fetch(
             """
@@ -357,7 +344,6 @@ async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     new_status, next_time, code_id
                 )
 
-            # Notify only on change
             if new_status != old_status:
                 await context.bot.send_message(
                     chat_id=user_id,
@@ -371,7 +357,7 @@ async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
 
         except Exception as e:
-            # Even if check fails, push next_check_at forward (avoid tight error loop)
+            # push next_check_at forward to avoid tight error loop
             next_time = now + timedelta(minutes=CHECK_INTERVAL_MINUTES)
             async with pool.acquire() as con:
                 await con.execute(
@@ -393,14 +379,16 @@ async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
 # =========================================================
-# FastAPI Webhook
+# FastAPI Webhook endpoints
 # =========================================================
 @fastapi_app.on_event("startup")
 async def on_startup():
     global tg_app
     await db_init()
 
-    tg_app = Application.builder().token(BOT_TOKEN).build()
+    # ✅ FIX: explicitly attach a JobQueue
+    jq = JobQueue()
+    tg_app = Application.builder().token(BOT_TOKEN).job_queue(jq).build()
 
     tg_app.add_handler(CommandHandler("start", start_cmd))
     tg_app.add_handler(CommandHandler("setcookie", setcookie_cmd))
@@ -414,7 +402,7 @@ async def on_startup():
     await tg_app.initialize()
     await tg_app.start()
 
-    # Start scheduler
+    # scheduler
     tg_app.job_queue.run_repeating(
         scheduler_job,
         interval=SCHEDULER_POLL_SECONDS,
@@ -422,7 +410,7 @@ async def on_startup():
         name="global_scheduler"
     )
 
-    # Set webhook
+    # webhook
     webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
     await tg_app.bot.set_webhook(webhook_url)
     print("Webhook set to:", webhook_url)
