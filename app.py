@@ -1,515 +1,222 @@
 import os
 import re
-import base64
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+import time
+import sqlite3
+from typing import List, Optional, Dict, Any
 
-import asyncpg
-import httpx
-from cryptography.fernet import Fernet
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    JobQueue,
-)
+# ---------------- CONFIG ----------------
+DB_PATH = os.getenv("DB_PATH", "validator.db")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me")  # set in Render env
+MAX_CODES_PER_REQUEST = int(os.getenv("MAX_CODES_PER_REQUEST", "500"))
 
-# =========================================================
-# ENV
-# =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()           # https://your-service.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()   # random secret string
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()       # Supabase Postgres URL
-COOKIE_SECRET = os.getenv("COOKIE_SECRET", "").strip()     # random long string
+CODE_RE = re.compile(r"^[A-Za-z0-9_\-]{4,64}$")
 
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
-SCHEDULER_POLL_SECONDS = int(os.getenv("SCHEDULER_POLL_SECONDS", "60"))
+app = FastAPI(title="Coupon Validator API", version="1.0.0")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
-if not PUBLIC_URL:
-    raise RuntimeError("PUBLIC_URL missing")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET missing")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL missing")
-if not COOKIE_SECRET:
-    raise RuntimeError("COOKIE_SECRET missing")
 
-# =========================================================
-# Encrypt cookies before storing (recommended)
-# =========================================================
-def _derive_fernet_key(secret: str) -> bytes:
-    raw = secret.encode("utf-8")
-    raw = raw[:32].ljust(32, b"\0")
-    return base64.urlsafe_b64encode(raw)
+# ---------------- DB ----------------
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
-FERNET = Fernet(_derive_fernet_key(COOKIE_SECRET))
+def init_db():
+    conn = db()
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS coupons (
+        code TEXT PRIMARY KEY,
+        working INTEGER NOT NULL DEFAULT 1,        -- 1=active, 0=disabled
+        expires_at INTEGER DEFAULT NULL,           -- unix seconds
+        max_uses INTEGER DEFAULT NULL,             -- NULL=unlimited
+        used_count INTEGER NOT NULL DEFAULT 0,
+        note TEXT DEFAULT ''
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-def encrypt_cookie(cookie: str) -> str:
-    return FERNET.encrypt(cookie.encode("utf-8")).decode("utf-8")
+@app.on_event("startup")
+def _startup():
+    init_db()
 
-def decrypt_cookie(cookie_enc: str) -> str:
-    return FERNET.decrypt(cookie_enc.encode("utf-8")).decode("utf-8")
 
-# =========================================================
-# DB
-# =========================================================
-pool: Optional[asyncpg.Pool] = None
+# ---------------- MODELS ----------------
+class ValidateRequest(BaseModel):
+    # Optional client token (you can pass whatever you want; can be ignored or enforced)
+    token: Optional[str] = None
+    coupons: List[str] = Field(default_factory=list)
 
-async def db_init():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+class ValidateResult(BaseModel):
+    code: str
+    working: bool
+    reason: str = ""
 
-async def ensure_user(user_id: int):
-    async with pool.acquire() as con:
-        await con.execute(
-            "insert into public.tg_users(user_id) values($1) on conflict do nothing",
-            user_id
-        )
+class ValidateResponse(BaseModel):
+    results: List[ValidateResult]
 
-async def set_user_cookie(user_id: int, cookie_plain: str):
-    await ensure_user(user_id)
-    enc = encrypt_cookie(cookie_plain)
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            insert into public.user_cookies(user_id, cookie_enc)
-            values($1, $2)
-            on conflict (user_id)
-            do update set cookie_enc=excluded.cookie_enc, updated_at=now()
-            """,
-            user_id, enc
-        )
+class UpsertCoupon(BaseModel):
+    code: str
+    working: bool = True
+    expires_at: Optional[int] = None  # unix seconds
+    max_uses: Optional[int] = None
+    note: str = ""
 
-async def delete_user_cookie(user_id: int):
-    async with pool.acquire() as con:
-        await con.execute("delete from public.user_cookies where user_id=$1", user_id)
+class UpsertResponse(BaseModel):
+    ok: bool
+    inserted_or_updated: int
 
-async def get_user_cookie(user_id: int) -> Optional[str]:
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            "select cookie_enc from public.user_cookies where user_id=$1",
-            user_id
-        )
+class CouponRow(BaseModel):
+    code: str
+    working: bool
+    expires_at: Optional[int]
+    max_uses: Optional[int]
+    used_count: int
+    note: str
+
+
+# ---------------- HELPERS ----------------
+def normalize_code(s: str) -> str:
+    s = (s or "").strip()
+    return s.upper()
+
+def validate_format(code: str) -> Optional[str]:
+    if not code:
+        return "empty"
+    if not CODE_RE.match(code):
+        return "bad_format"
+    return None
+
+def fetch_coupon(code: str) -> Optional[Dict[str, Any]]:
+    conn = db()
+    cur = conn.execute(
+        "SELECT code, working, expires_at, max_uses, used_count, note FROM coupons WHERE code=?",
+        (code,)
+    )
+    row = cur.fetchone()
+    conn.close()
     if not row:
         return None
-    return decrypt_cookie(row["cookie_enc"])
-
-# =========================================================
-# Helpers
-# =========================================================
-def normalize_code(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"\s+", "", text)
-    return text
-
-def status_emoji(status: str) -> str:
-    return {"valid": "✅", "invalid": "❌", "unknown": "⚠️"}.get(status, "⚠️")
-
-# =========================================================
-# SHEIN CHECKER (REAL endpoint based on your cURL)
-# =========================================================
-SHEIN_APPLY_VOUCHER_URL = "https://www.sheinindia.in/api/cart/apply-voucher"
-
-async def check_shein_code_with_cookie(code: str, cookie: str) -> Dict[str, Any]:
-    headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "origin": "https://www.sheinindia.in",
-        "referer": "https://www.sheinindia.in/cart",
-        "user-agent": "Mozilla/5.0",
-        "x-tenant-id": "SHEIN",
-        "cookie": cookie,
+    return {
+        "code": row[0],
+        "working": bool(row[1]),
+        "expires_at": row[2],
+        "max_uses": row[3],
+        "used_count": row[4],
+        "note": row[5] or ""
     }
 
-    payload = {"voucherId": code, "device": {"client_type": "web"}}
+def is_coupon_working(row: Dict[str, Any]) -> (bool, str):
+    now = int(time.time())
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(SHEIN_APPLY_VOUCHER_URL, headers=headers, json=payload)
+    if not row["working"]:
+        return False, "disabled"
 
-        try:
-            data = r.json()
-        except Exception:
-            data = None
+    exp = row["expires_at"]
+    if exp is not None and now >= int(exp):
+        return False, "expired"
 
-        if r.status_code == 200:
-            msg = ""
-            if isinstance(data, dict):
-                msg = data.get("msg") or data.get("message") or data.get("tip") or ""
-            return {"status": "valid", "details": msg or "Applied successfully."}
+    max_uses = row["max_uses"]
+    if max_uses is not None and int(row["used_count"]) >= int(max_uses):
+        return False, "max_uses_reached"
 
-        if r.status_code == 400:
-            msg = ""
-            if isinstance(data, dict):
-                msg = data.get("msg") or data.get("message") or data.get("tip") or ""
-                if not msg and isinstance(data.get("info"), dict):
-                    msg = data["info"].get("msg") or data["info"].get("message") or ""
-            return {"status": "invalid", "details": msg or "Invalid / not applicable."}
+    return True, "ok"
 
-        if r.status_code in (401, 403):
-            return {"status": "unknown", "details": "Cookie expired / not authorized. Please /setcookie again."}
 
-        if r.status_code == 429:
-            return {"status": "unknown", "details": "Rate limited by SHEIN (429). Try later."}
+# ---------------- ROUTES ----------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "coupon-validator", "time": int(time.time())}
 
-        preview = ""
-        if isinstance(data, dict):
-            preview = str(data)[:300]
-        else:
-            preview = (r.text or "")[:300]
+@app.post("/validate", response_model=ValidateResponse)
+def validate(req: ValidateRequest):
+    coupons = [normalize_code(c) for c in (req.coupons or [])]
+    coupons = [c for c in coupons if c]  # remove empties
 
-        return {"status": "unknown", "details": f"HTTP {r.status_code}. {preview}"}
+    if len(coupons) == 0:
+        return {"results": []}
 
-    except httpx.TimeoutException:
-        return {"status": "unknown", "details": "Timeout contacting SHEIN. Try again."}
-    except Exception as e:
-        return {"status": "unknown", "details": f"Checker error: {e}"}
+    if len(coupons) > MAX_CODES_PER_REQUEST:
+        raise HTTPException(status_code=400, detail=f"Too many coupons (max {MAX_CODES_PER_REQUEST})")
 
-# =========================================================
-# Telegram Bot + FastAPI Webhook
-# =========================================================
-fastapi_app = FastAPI()
-tg_app: Optional[Application] = None
+    results: List[ValidateResult] = []
 
-# Users who are currently in "waiting for cookie"
-COOKIE_WAITING = set()
+    for code in coupons:
+        fmt = validate_format(code)
+        if fmt:
+            results.append(ValidateResult(code=code, working=False, reason=fmt))
+            continue
 
-# ---------------- Commands ----------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 SHEIN Code Checker + Protector Bot\n\n"
-        "Setup:\n"
-        "1) /setcookie\n"
-        "   - Paste cookie in 1 message OR upload cookie.txt\n"
-        "2) /check CODE or just send a code\n"
-        "3) /protect CODE (auto-check every 15 minutes)\n\n"
-        "Commands:\n"
-        "/setcookie - upload cookie (message or file)\n"
-        "/delcookie - delete cookie\n"
-        "/protect CODE - enable protection\n"
-        "/remove CODE - remove protected code\n"
-        "/mycodes - list protected codes\n"
-        "/check CODE - check code now\n"
+        row = fetch_coupon(code)
+        if not row:
+            results.append(ValidateResult(code=code, working=False, reason="not_found"))
+            continue
+
+        ok, reason = is_coupon_working(row)
+        results.append(ValidateResult(code=code, working=ok, reason=reason))
+
+    return {"results": results}
+
+# ---- Admin: Add/Update coupons ----
+@app.post("/admin/upsert", response_model=UpsertResponse)
+def admin_upsert(items: List[UpsertCoupon], x_api_key: str = Header(default="")):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not items:
+        return {"ok": True, "inserted_or_updated": 0}
+
+    conn = db()
+    count = 0
+    for it in items:
+        code = normalize_code(it.code)
+        fmt = validate_format(code)
+        if fmt:
+            continue
+        conn.execute(
+            "INSERT INTO coupons(code, working, expires_at, max_uses, used_count, note) "
+            "VALUES(?,?,?,?,COALESCE((SELECT used_count FROM coupons WHERE code=?),0),?) "
+            "ON CONFLICT(code) DO UPDATE SET working=excluded.working, expires_at=excluded.expires_at, "
+            "max_uses=excluded.max_uses, note=excluded.note",
+            (
+                code,
+                1 if it.working else 0,
+                it.expires_at,
+                it.max_uses,
+                code,
+                it.note or ""
+            )
+        )
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "inserted_or_updated": count}
+
+@app.get("/admin/list", response_model=List[CouponRow])
+def admin_list(limit: int = 200, x_api_key: str = Header(default="")):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    limit = max(1, min(1000, limit))
+    conn = db()
+    cur = conn.execute(
+        "SELECT code, working, expires_at, max_uses, used_count, note FROM coupons ORDER BY code LIMIT ?",
+        (limit,)
     )
+    rows = cur.fetchall()
+    conn.close()
 
-async def setcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    COOKIE_WAITING.add(user_id)
-    await update.message.reply_text(
-        "🧾 Send your SHEIN cookie now.\n\n"
-        "✅ Option 1: Paste cookie in ONE message\n"
-        "✅ Option 2 (BEST): Upload a file cookie.txt containing the full cookie\n\n"
-        "Tip: Browser → DevTools → Network → request → Headers → Cookie"
-    )
-
-async def delcookie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    await delete_user_cookie(user_id)
-    await update.message.reply_text("✅ Cookie deleted.")
-
-async def protect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /protect CODE")
-        return
-
-    cookie = await get_user_cookie(user_id)
-    if not cookie:
-        await update.message.reply_text("❌ Set your cookie first: /setcookie")
-        return
-
-    code = normalize_code("".join(context.args))
-    await ensure_user(user_id)
-
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            insert into public.protected_codes(user_id, code, next_check_at)
-            values($1, $2, now())
-            on conflict (user_id, code) do update
-              set next_check_at = now()
-            """,
-            user_id, code
-        )
-
-    await update.message.reply_text(f"🛡️ Protection enabled for `{code}`.", parse_mode="Markdown")
-
-async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /remove CODE")
-        return
-
-    code = normalize_code("".join(context.args))
-    async with pool.acquire() as con:
-        await con.execute(
-            "delete from public.protected_codes where user_id=$1 and code=$2",
-            user_id, code
-        )
-
-    await update.message.reply_text(f"Removed `{code}` (if it existed).", parse_mode="Markdown")
-
-async def mycodes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            select code, last_status, next_check_at
-            from public.protected_codes
-            where user_id=$1
-            order by next_check_at asc
-            """,
-            user_id
-        )
-
-    if not rows:
-        await update.message.reply_text("No protected codes. Use /protect CODE")
-        return
-
-    lines = ["🛡️ Your protected codes:"]
+    out = []
     for r in rows:
-        st = r["last_status"]
-        lines.append(f"- `{r['code']}` → {status_emoji(st)} *{st.upper()}* (next: {r['next_check_at']})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /check CODE")
-        return
-
-    code = normalize_code("".join(context.args))
-    cookie = await get_user_cookie(user_id)
-    if not cookie:
-        await update.message.reply_text("❌ Set your cookie first: /setcookie")
-        return
-
-    msg = await update.message.reply_text(f"🔎 Checking `{code}` ...", parse_mode="Markdown")
-    result = await check_shein_code_with_cookie(code, cookie)
-    st = result.get("status", "unknown")
-    details = result.get("details", "")
-    await msg.edit_text(
-        f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}",
-        parse_mode="Markdown"
-    )
-
-# ---------------- NEW: Cookie upload via file ----------------
-async def on_cookie_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-
-    if user_id not in COOKIE_WAITING:
-        await update.message.reply_text("Use /setcookie first, then upload cookie.txt")
-        return
-
-    doc = update.message.document
-    if not doc:
-        return
-
-    # Optional: only allow .txt (not mandatory)
-    # if doc.file_name and not doc.file_name.lower().endswith(".txt"):
-    #     await update.message.reply_text("Please upload a .txt file containing the cookie.")
-    #     return
-
-    tg_file = await context.bot.get_file(doc.file_id)
-    content_bytes = await tg_file.download_as_bytearray()
-    cookie_text = content_bytes.decode("utf-8", errors="ignore").strip()
-
-    COOKIE_WAITING.remove(user_id)
-    await set_user_cookie(user_id, cookie_text)
-
-    # Try to delete file message (privacy)
-    try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-    except:
-        pass
-
-    await update.effective_chat.send_message("✅ Cookie file saved. Now try /check CODE or send a code.")
-
-# ---------------- Text Handler ----------------
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    # Cookie capture by text
-    if user_id in COOKIE_WAITING:
-        COOKIE_WAITING.remove(user_id)
-        await set_user_cookie(user_id, text)
-
-        # Try to delete cookie message (privacy)
-        try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
-        except:
-            pass
-
-        await update.effective_chat.send_message("✅ Cookie saved. Now try /check CODE or send a code.")
-        return
-
-    if text.startswith("/"):
-        return
-
-    # User sends a code directly
-    code = normalize_code(text)
-    cookie = await get_user_cookie(user_id)
-    if not cookie:
-        await update.message.reply_text("❌ Set your cookie first: /setcookie")
-        return
-
-    msg = await update.message.reply_text(f"🔎 Checking `{code}` ...", parse_mode="Markdown")
-    result = await check_shein_code_with_cookie(code, cookie)
-    st = result.get("status", "unknown")
-    details = result.get("details", "")
-    await msg.edit_text(
-        f"Result for `{code}`: {status_emoji(st)} *{st.upper()}*\n{details}\n\n"
-        f"Enable auto-check every {CHECK_INTERVAL_MINUTES} minutes:\n"
-        f"Use: /protect {code}",
-        parse_mode="Markdown"
-    )
-
-# =========================================================
-# Scheduler: checks ONLY DUE codes from DB
-# =========================================================
-async def scheduler_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.now(timezone.utc)
-
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            select pc.id, pc.user_id, pc.code, pc.last_status, uc.cookie_enc
-            from public.protected_codes pc
-            join public.user_cookies uc on uc.user_id = pc.user_id
-            where pc.next_check_at <= now()
-            order by pc.next_check_at asc
-            limit 50
-            """
-        )
-
-    if not rows:
-        return
-
-    for r in rows:
-        code_id = r["id"]
-        user_id = int(r["user_id"])
-        code = r["code"]
-        old_status = r["last_status"] or "unknown"
-
-        try:
-            cookie_plain = decrypt_cookie(r["cookie_enc"])
-            result = await check_shein_code_with_cookie(code, cookie_plain)
-            new_status = result.get("status", "unknown")
-            details = result.get("details", "")
-
-            next_time = now + timedelta(minutes=CHECK_INTERVAL_MINUTES)
-
-            async with pool.acquire() as con:
-                await con.execute(
-                    """
-                    update public.protected_codes
-                    set last_status=$1,
-                        last_checked_at=now(),
-                        next_check_at=$2
-                    where id=$3
-                    """,
-                    new_status, next_time, code_id
-                )
-
-            if new_status != old_status:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"🛡️ Protection update\n"
-                        f"Code: `{code}`\n"
-                        f"Status: {status_emoji(new_status)} *{new_status.upper()}* (was {old_status})\n"
-                        f"{details}"
-                    ),
-                    parse_mode="Markdown"
-                )
-
-        except Exception as e:
-            next_time = now + timedelta(minutes=CHECK_INTERVAL_MINUTES)
-            async with pool.acquire() as con:
-                await con.execute(
-                    """
-                    update public.protected_codes
-                    set last_checked_at=now(),
-                        next_check_at=$1
-                    where id=$2
-                    """,
-                    next_time, code_id
-                )
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⚠️ Protection check failed for `{code}`: {e}",
-                    parse_mode="Markdown"
-                )
-            except:
-                pass
-
-# =========================================================
-# FastAPI Webhook endpoints
-# =========================================================
-@fastapi_app.on_event("startup")
-async def on_startup():
-    global tg_app
-    await db_init()
-
-    jq = JobQueue()
-    tg_app = Application.builder().token(BOT_TOKEN).job_queue(jq).build()
-
-    tg_app.add_handler(CommandHandler("start", start_cmd))
-    tg_app.add_handler(CommandHandler("setcookie", setcookie_cmd))
-    tg_app.add_handler(CommandHandler("delcookie", delcookie_cmd))
-    tg_app.add_handler(CommandHandler("protect", protect_cmd))
-    tg_app.add_handler(CommandHandler("remove", remove_cmd))
-    tg_app.add_handler(CommandHandler("mycodes", mycodes_cmd))
-    tg_app.add_handler(CommandHandler("check", check_cmd))
-
-    # ✅ IMPORTANT: file handler BEFORE text handler
-    tg_app.add_handler(MessageHandler(filters.Document.ALL, on_cookie_file))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    await tg_app.initialize()
-    await tg_app.start()
-
-    tg_app.job_queue.run_repeating(
-        scheduler_job,
-        interval=SCHEDULER_POLL_SECONDS,
-        first=10,
-        name="global_scheduler"
-    )
-
-    webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
-    await tg_app.bot.set_webhook(webhook_url)
-    print("Webhook set to:", webhook_url)
-
-@fastapi_app.on_event("shutdown")
-async def on_shutdown():
-    global tg_app
-    if tg_app:
-        await tg_app.stop()
-        await tg_app.shutdown()
-
-@fastapi_app.get("/")
-async def root():
-    return {"ok": True, "message": "Bot is running."}
-
-@fastapi_app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
-        return {"ok": False, "error": "bad secret"}
-
-    data = await request.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
-    return {"ok": True}
+        out.append(CouponRow(
+            code=r[0],
+            working=bool(r[1]),
+            expires_at=r[2],
+            max_uses=r[3],
+            used_count=r[4],
+            note=r[5] or ""
+        ))
+    return out
